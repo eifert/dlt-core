@@ -108,6 +108,9 @@ impl From<nom::Err<(&[u8], nom::error::ErrorKind)>> for DltParseError {
         }
     }
 }
+lazy_static! {
+    static ref FINDER: memchr::memmem::Finder<'static> = memchr::memmem::Finder::new(DLT_PATTERN);
+}
 
 /// Skips ahead in input array up to the next storage header
 ///
@@ -121,9 +124,7 @@ impl From<nom::Err<(&[u8], nom::error::ErrorKind)>> for DltParseError {
 /// * `input` - A slice of bytes that contain dlt messages including storage headers
 ///
 pub fn forward_to_next_storage_header(input: &[u8]) -> Option<(u64, &[u8])> {
-    use memchr::memmem;
-    let finder = memmem::Finder::new(DLT_PATTERN);
-    finder.find(input).map(|to_drop| {
+    FINDER.find(input).map(|to_drop| {
         if to_drop > 0 {
             trace!("Need to drop {} bytes to get to next message", to_drop);
         }
