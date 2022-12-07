@@ -24,6 +24,7 @@ use crate::{
 };
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use nom::{
+    branch::alt,
     bytes::streaming::{tag, take, take_while_m_n},
     combinator::map,
     error::{ErrorKind, ParseError},
@@ -41,6 +42,7 @@ use thiserror::Error;
 
 /// DLT pattern at the start of a storage header
 pub const DLT_PATTERN: &[u8] = &[0x44, 0x4C, 0x54, 0x01];
+pub const DLS_PATTERN: &[u8] = &[0x44, 0x4C, 0x53, 0x01];
 
 pub(crate) fn parse_ecu_id(input: &[u8]) -> IResult<&[u8], &str, DltParseError> {
     dlt_zero_terminated_string(input, 4)
@@ -109,7 +111,10 @@ impl From<nom::Err<(&[u8], nom::error::ErrorKind)>> for DltParseError {
     }
 }
 lazy_static! {
-    static ref FINDER: memchr::memmem::Finder<'static> = memchr::memmem::Finder::new(DLT_PATTERN);
+    static ref DLT_PATTERN_FINDER: memchr::memmem::Finder<'static> =
+        memchr::memmem::Finder::new(DLT_PATTERN);
+    static ref DLS_PATTERN_FINDER: memchr::memmem::Finder<'static> =
+        memchr::memmem::Finder::new(DLS_PATTERN);
 }
 
 /// Skips ahead in input array up to the next storage header
@@ -124,7 +129,7 @@ lazy_static! {
 /// * `input` - A slice of bytes that contain dlt messages including storage headers
 ///
 pub fn forward_to_next_storage_header(input: &[u8]) -> Option<(u64, &[u8])> {
-    FINDER.find(input).map(|to_drop| {
+    DLT_PATTERN_FINDER.find(input).map(|to_drop| {
         if to_drop > 0 {
             trace!("Need to drop {} bytes to get to next message", to_drop);
         }
@@ -144,7 +149,7 @@ pub(crate) fn dlt_storage_header(
     match forward_to_next_storage_header(input) {
         Some((consumed, rest)) => {
             let (input, (_, _, seconds, microseconds)) =
-                tuple((tag("DLT"), tag(&[0x01]), le_u32, le_u32))(rest)?;
+                tuple((alt((tag("DLT"), tag("DLS"))), tag(&[0x01]), le_u32, le_u32))(rest)?;
 
             let (after_string, ecu_id) = dlt_zero_terminated_string(input, 4)?;
             Ok((
@@ -160,6 +165,32 @@ pub(crate) fn dlt_storage_header(
                     consumed,
                 )),
             ))
+        }
+        None => {
+            warn!("Did not find another storage header in file");
+            Ok((&[], None))
+        }
+    }
+}
+
+pub fn forward_to_next_serial_header(input: &[u8]) -> Option<(u64, &[u8])> {
+    DLS_PATTERN_FINDER.find(input).map(|to_drop| {
+        if to_drop > 0 {
+            trace!("Need to drop {} bytes to get to next message", to_drop);
+        }
+        (to_drop as u64, &input[to_drop..])
+    })
+}
+
+pub(crate) fn dlt_serial_header(input: &[u8]) -> IResult<&[u8], Option<u64>, DltParseError> {
+    if input.len() < 4 as usize {
+        return Err(nom::Err::Incomplete(nom::Needed::Unknown));
+    }
+    match forward_to_next_serial_header(input) {
+        Some((consumed, rest)) => {
+            let (input, (_, _)) = tuple((alt((tag("DLT"), tag("DLS"))), tag(&[0x01])))(rest)?;
+
+            Ok((input, Some(consumed)))
         }
         None => {
             warn!("Did not find another storage header in file");
@@ -755,6 +786,16 @@ pub enum ParsedMessage {
     Invalid,
 }
 
+/// Additional prefix header to be parsed before each message
+pub enum Header {
+    /// No header to be parsed
+    None,
+    /// Storage header with reception timestamp and ECU ID
+    Storage,
+    /// "Serial" header, just a ["D","L","S",0x01] tag with no further data
+    Serial,
+}
+
 /// Parse a DLT-message from some binary input data.
 ///
 /// A DLT message looks like this: `<STANDARD-HEADER><EXTENDED-HEADER><PAYLOAD>`
@@ -799,22 +840,23 @@ pub enum ParsedMessage {
 pub fn dlt_message<'a>(
     input: &'a [u8],
     filter_config_opt: Option<&filtering::ProcessedDltFilterConfig>,
-    with_storage_header: bool,
+    header: Header,
 ) -> Result<(&'a [u8], ParsedMessage), DltParseError> {
-    dlt_message_intern(input, filter_config_opt, with_storage_header).map_err(DltParseError::from)
+    dlt_message_intern(input, filter_config_opt, header).map_err(DltParseError::from)
 }
 
 fn dlt_message_intern<'a>(
     input: &'a [u8],
     filter_config_opt: Option<&filtering::ProcessedDltFilterConfig>,
-    with_storage_header: bool,
+    header: Header,
 ) -> IResult<&'a [u8], ParsedMessage, DltParseError> {
     let (after_storage_header, storage_header_shifted): (&[u8], Option<(StorageHeader, u64)>) =
-        if with_storage_header {
-            dlt_storage_header(input)?
-        } else {
-            (input, None)
+        match header {
+            Header::None => (input, None),
+            Header::Storage => dlt_storage_header(input)?,
+            Header::Serial => (dlt_serial_header(input)?.0, None),
         };
+
     if let Some((storage_header, shifted)) = &storage_header_shifted {
         dbg_parsed(
             "storage header",
